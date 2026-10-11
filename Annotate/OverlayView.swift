@@ -157,13 +157,22 @@ class OverlayView: NSView, NSTextFieldDelegate {
 
     let eraserRadius: CGFloat = 12.0
 
-    var selectedObjects: Set<SelectedObject> = []
+    var selectedObjects: Set<SelectedObject> = [] {
+        // The bar's size chip reads the selection, so it refreshes when the selection does.
+        didSet { notifyToolbarChanged() }
+    }
     var selectionDragOffset: NSPoint?
     var selectionOriginalData: [SelectedObject: Any] = [:]
 
     var isDrawingSelectionRect: Bool = false
     var selectionRectStart: NSPoint?
     var selectionRectEnd: NSPoint?
+
+    /// Anchor being dragged to rescale a single selected label, plus that label and the
+    /// box it started from. Every drag event measures against that start state, so a
+    /// gesture cannot accumulate rounding drift across frames.
+    var resizeHandle: ResizeHandle?
+    var resizeStart: (index: Int, original: TextAnnotation, bounds: NSRect)?
 
     var clipboard: [ClipboardItem] = []
     var lastMousePosition: NSPoint = .zero
@@ -243,6 +252,12 @@ class OverlayView: NSView, NSTextFieldDelegate {
     }
 
     override func cursorUpdate(with event: NSEvent) {
+        // Over an anchor, the label is what is about to be dragged, not the tool cursor.
+        if resizeHandle != nil
+            || textResizeHandle(at: convert(event.locationInWindow, from: nil)) != nil {
+            NSCursor.closedHand.set()
+            return
+        }
         updateCursor()
         if !shouldShowActiveCursorForThisOverlay() && currentTool != .text {
             super.cursorUpdate(with: event)
@@ -449,6 +464,16 @@ class OverlayView: NSView, NSTextFieldDelegate {
                     if index < target.textAnnotations.count {
                         target.textAnnotations[index].position = oldPosition
                         target.registerUndo(action: .moveText(index, newPosition, oldPosition))
+                        target.needsDisplay = true
+                    }
+                }
+            }
+        case .resizeText(let index, let from, let to):
+            manager?.registerUndo(withTarget: self) { target in
+                MainActor.assumeIsolated {
+                    if index < target.textAnnotations.count {
+                        target.textAnnotations[index] = from
+                        target.registerUndo(action: .resizeText(index, to, from))
                         target.needsDisplay = true
                     }
                 }
@@ -892,7 +917,7 @@ class OverlayView: NSView, NSTextFieldDelegate {
         }
         
         // Add padding
-        let padding: CGFloat = 5.0
+        let padding = Self.selectionPadding
         return NSRect(
             x: minX - padding,
             y: minY - padding,
@@ -1000,6 +1025,165 @@ class OverlayView: NSView, NSTextFieldDelegate {
         path.setLineDash([5.0, 3.0], count: 2, phase: 0)
         NSColor.systemBlue.withAlphaComponent(0.8).setStroke()
         path.stroke()
+
+        // Anchors only on a single selected label: a multi-selection has no one box to
+        // transform, so it keeps the plain dashed rectangle.
+        guard selectedTextIndex() != nil else { return }
+        for handle in ResizeHandle.allCases {
+            let anchor = NSBezierPath(rect: Self.handleRect(for: handle, in: rect))
+            anchor.lineWidth = 1.5
+            NSColor.white.withAlphaComponent(0.95).setFill()
+            anchor.fill()
+            NSColor.systemBlue.setStroke()
+            anchor.stroke()
+        }
+    }
+
+    // MARK: - Text Resizing
+
+    /// The label under transformation: only a single selected text annotation has one
+    /// box to scale, so anything larger gets no handles.
+    func selectedTextIndex() -> Int? {
+        guard selectedObjects.count == 1, case .text(let index) = selectedObjects.first!,
+            index < textAnnotations.count
+        else { return nil }
+        return index
+    }
+
+    /// The selected label's font size. Size ladders, the size picker and Cmd+scroll all
+    /// read and step this, so a label can be resized after it was placed.
+    func selectedTextFontSize() -> CGFloat? {
+        selectedTextIndex().map { textAnnotations[$0].fontSize }
+    }
+
+    /// The anchor under `point`, or nil when no transformable label is selected there.
+    func textResizeHandle(at point: NSPoint) -> ResizeHandle? {
+        guard selectedTextIndex() != nil else { return nil }
+        let box = calculateSelectionBoundingBox()
+        for handle in ResizeHandle.allCases {
+            if Self.handleRect(for: handle, in: box)
+                .insetBy(dx: -Self.handleHitSlop, dy: -Self.handleHitSlop)
+                .contains(point)
+            { return handle }
+        }
+        return nil
+    }
+
+    /// Visible size of an anchor square. Small on purpose: they must not bury the label.
+    static let handleSize: CGFloat = 7
+    /// Grabbing a few pixels outside a square still starts the drag.
+    static let handleHitSlop: CGFloat = 5
+
+    /// One of the eight anchors of `box`: a corner, or an edge midpoint.
+    static func anchorPoint(for handle: ResizeHandle, in box: NSRect) -> NSPoint {
+        NSPoint(
+            x: handle == .n || handle == .s ? box.midX
+                : (handle.movesWest ? box.minX : box.maxX),
+            y: handle == .w || handle == .e ? box.midY
+                : (handle.movesSouth ? box.minY : box.maxY))
+    }
+
+    static func handleRect(for handle: ResizeHandle, in box: NSRect) -> NSRect {
+        let anchor = anchorPoint(for: handle, in: box)
+        return NSRect(
+            x: anchor.x - handleSize / 2, y: anchor.y - handleSize / 2,
+            width: handleSize, height: handleSize)
+    }
+
+    /// Captures where the gesture starts: the label as it was and the box the anchors
+    /// were drawn on.
+    func beginTextResize(_ handle: ResizeHandle) {
+        guard let index = selectedTextIndex() else { return }
+        resizeHandle = handle
+        resizeStart = (index, textAnnotations[index], calculateSelectionBoundingBox())
+    }
+
+    /// Rescales the label so the sides its handle does not touch keep their edge.
+    func updateTextResize(to point: NSPoint) {
+        guard let handle = resizeHandle, let start = resizeStart,
+            start.index < textAnnotations.count
+        else { return }
+
+        let old = start.bounds
+        var minX = old.minX, maxX = old.maxX, minY = old.minY, maxY = old.maxY
+        // Clamped to the opposite side, so dragging past it can never flip the label.
+        if handle.movesWest { minX = min(point.x, maxX) }
+        if handle.movesEast { maxX = max(point.x, minX) }
+        if handle.movesSouth { minY = min(point.y, maxY) }
+        if handle.movesNorth { maxY = max(point.y, minY) }
+
+        let ratioW = (maxX - minX) / max(old.width, 1)
+        let ratioH = (maxY - minY) / max(old.height, 1)
+
+        let insets =
+            start.original.hasBackground ? TextAnnotation.pillInsets : Self.plainLabelSlop
+        var annotation = start.original
+
+        let hasHorizontal = handle.movesWest || handle.movesEast
+        let hasVertical = handle.movesNorth || handle.movesSouth
+
+        // Any anchor that moves sideways fixes a width: the font stays where it is across
+        // that axis and AppKit rewraps the text, so the box changes shape instead of only
+        // getting bigger. A top or bottom anchor has no sideways component and so only
+        // scales the point size.
+        if hasHorizontal {
+            let padding = Self.selectionPadding * 2 + insets.left + insets.right
+            annotation.wrapWidth =
+                max(TextAnnotation.minimumWrapWidth, (maxX - minX) - padding)
+        }
+        if hasVertical {
+            // A corner scales on the tighter axis so the label never overshoots the box the
+            // user dragged out; a top or bottom handle only moves along its own axis.
+            let ratio = hasHorizontal ? min(ratioW, ratioH) : ratioH
+            guard ratio > 0 else { return }
+            annotation.fontSize =
+                (start.original.fontSize * ratio).clamped(to: textAnnotationFontSizeRange)
+        }
+
+        // Measure at the new size, then pad back out so the fixed edges line up with the
+        // box the anchors were drawn on rather than the raw text rect inside it.
+        let measured = annotation.bounds(fallbackInsets: Self.plainLabelSlop)
+            .insetBy(dx: -Self.selectionPadding, dy: -Self.selectionPadding)
+        var originX = old.minX
+        if handle.movesWest { originX = maxX - measured.width }
+        // A width-only drag hangs from the top so the first line stays put while later lines
+        // wrap downward; a vertical drag keeps the opposite edge it grew from.
+        var originY = old.minY
+        if !hasVertical || handle.movesSouth { originY = maxY - measured.height }
+        annotation.position = NSPoint(
+            x: originX + Self.selectionPadding + insets.left,
+            y: originY + Self.selectionPadding + insets.bottom)
+
+        textAnnotations[start.index] = annotation
+        needsDisplay = true
+        notifyToolbarChanged()
+    }
+
+    /// Ends the gesture, leaving the whole resize (size and position) as one undo step.
+    func endTextResize() {
+        defer {
+            resizeHandle = nil
+            resizeStart = nil
+        }
+        guard let start = resizeStart, start.index < textAnnotations.count else { return }
+        let resized = textAnnotations[start.index]
+        guard resized != start.original else { return }
+        registerUndo(action: .resizeText(start.index, start.original, resized))
+        notifyToolbarChanged()
+    }
+
+    /// Applies a picked size to the single selected label, leaving the old one undoable.
+    func setSelectedTextFontSize(_ size: CGFloat) {
+        guard let index = selectedTextIndex(), size != textAnnotations[index].fontSize else {
+            return
+        }
+        let original = textAnnotations[index]
+        var updated = original
+        updated.fontSize = size
+        textAnnotations[index] = updated
+        registerUndo(action: .resizeText(index, original, updated))
+        needsDisplay = true
+        notifyToolbarChanged()
     }
     
     /// Check if a point is inside the bounding box of any selected object
@@ -1646,7 +1830,20 @@ class OverlayView: NSView, NSTextFieldDelegate {
             pill.fill()
         }
 
-        attributedString.draw(at: annotation.position)
+        // A wrapped label is laid out by AppKit inside its fixed width, which is what makes
+        // it grow taller instead of wider. A plain label keeps drawing from its origin.
+        if annotation.wrapWidth != nil {
+            let textRect = NSRect(
+                x: annotation.position.x,
+                y: annotation.position.y,
+                width: annotation.wrapWidth!,
+                height: annotation.textSize().height)
+            attributedString.draw(
+                with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil)
+        } else {
+            attributedString.draw(at: annotation.position)
+        }
     }
 
     private func drawCounter(_ counter: CounterAnnotation, alpha: CGFloat) {
@@ -2247,7 +2444,7 @@ class OverlayView: NSView, NSTextFieldDelegate {
         textField.isSelectable = true
         textField.isBezeled = false
         textField.usesSingleLineMode = false
-        textField.cell?.wraps = false
+        textField.cell?.wraps = currentTextAnnotation?.wrapWidth != nil
         textField.cell?.truncatesLastVisibleLine = false
         textField.stringValue = existingText
         textField.target = self
@@ -2369,6 +2566,7 @@ class OverlayView: NSView, NSTextFieldDelegate {
                 color: currentText.color,
                 fontSize: currentText.fontSize,
                 hasBackground: currentText.hasBackground,
+                wrapWidth: currentText.wrapWidth,
                 creationTime: isEdit
                     ? CACurrentMediaTime() : (currentText.creationTime ?? CACurrentMediaTime())
             )
@@ -2470,6 +2668,16 @@ class OverlayView: NSView, NSTextFieldDelegate {
     /// padding (horizontal cursor slack and a 32pt height floor). Callers apply any
     /// screen-edge clamping themselves. Single source of truth for text-field sizing.
     private func textFieldBoxSize(forText text: String, font: NSFont) -> NSSize {
+        // A wrapped label keeps its width while editing so the field breaks lines exactly
+        // where the committed label will; the cell insets the text by 8 on each side.
+        if let wrapWidth = currentTextAnnotation?.wrapWidth {
+            let measured = (text as NSString).boundingRect(
+                with: NSSize(width: wrapWidth, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: [.font: font])
+            return NSSize(
+                width: wrapWidth + 16, height: max(32, ceil(measured.height) + 8))
+        }
         let size = text.size(withAttributes: [.font: font])
         return NSSize(width: max(Self.textFieldMinWidth, size.width + 32), height: max(32, size.height + 8))
     }
@@ -2971,6 +3179,10 @@ class OverlayView: NSView, NSTextFieldDelegate {
     /// Slop added to a label that draws without a background, so hit testing, erasing and
     /// marquee selection stay as forgiving as they were before background pills existed.
     static var plainLabelSlop: NSEdgeInsets { NSEdgeInsets(top: 4, left: 0, bottom: 0, right: 4) }
+
+    /// Space between a selected label's text and the dashed box (and its anchors) drawn
+    /// on it. Kept in one place so drawing and the resize math agree on where the edges are.
+    static let selectionPadding: CGFloat = 5.0
 
     private func getTextRect(for annotation: TextAnnotation) -> NSRect {
         annotation.bounds(fallbackInsets: Self.plainLabelSlop)

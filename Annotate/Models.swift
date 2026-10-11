@@ -131,6 +131,21 @@ enum SelectedObject: Equatable, Hashable {
     }
 }
 
+/// The eight anchor squares drawn on a single selected text annotation's box. Which
+/// sides a handle leaves alone decides which edge stays put while you drag it.
+enum ResizeHandle: CaseIterable, Hashable {
+    case nw, n, ne, e, se, s, sw, w
+
+    /// The handle sits on the box's left edge, so dragging it changes `minX`.
+    var movesWest: Bool { self == .nw || self == .w || self == .sw }
+    /// The handle sits on the box's right edge.
+    var movesEast: Bool { self == .ne || self == .e || self == .se }
+    /// The handle sits on the box's top edge.
+    var movesNorth: Bool { self == .nw || self == .n || self == .ne }
+    /// The handle sits on the box's bottom edge.
+    var movesSouth: Bool { self == .sw || self == .s || self == .se }
+}
+
 /// Represents a timed point for pen/highlighter so we can do trailing fade-out
 struct TimedPoint {
     var point: NSPoint
@@ -250,7 +265,14 @@ struct TextAnnotation {
     var color: NSColor
     var fontSize: CGFloat
     var hasBackground: Bool = false
+    /// Fixed text width set by dragging a side anchor, so the label wraps to several lines
+    /// instead of growing wider. `nil` keeps the original behavior: one line, width
+    /// following the text.
+    var wrapWidth: CGFloat? = nil
     var creationTime: CFTimeInterval?
+
+    /// The narrowest a side anchor can pull the box before the text has nowhere to go.
+    static let minimumWrapWidth: CGFloat = 24
 
     /// Padding between the text and the edge of the background pill.
     static var pillInsets: NSEdgeInsets { NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8) }
@@ -277,12 +299,27 @@ struct TextAnnotation {
     }
 
     /// Bounds of the label, measuring the text with the annotation's own font.
+    ///
+    /// Wrapped labels measure through `textSize()`, so the box grows taller as the text
+    /// breaks into more lines at `wrapWidth`.
     func bounds(fallbackInsets: NSEdgeInsets) -> NSRect {
+        bounds(textSize: textSize(), fallbackInsets: fallbackInsets)
+    }
+
+    /// Measured text size at this annotation's font, wrapped to `wrapWidth` when set.
+    /// AppKit does the line breaking, so a wrapped label measures exactly what the drawn
+    /// text occupies.
+    func textSize() -> NSSize {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: fontSize)
         ]
-        return bounds(
-            textSize: text.size(withAttributes: attributes), fallbackInsets: fallbackInsets)
+        guard let wrapWidth else { return text.size(withAttributes: attributes) }
+        let measured = (text as NSString).boundingRect(
+            with: NSSize(width: wrapWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: attributes)
+        // Ceil so the last line's descenders are never clipped by the box.
+        return NSSize(width: wrapWidth, height: ceil(measured.height))
     }
 }
 
@@ -351,6 +388,7 @@ enum DrawingAction {
     case addText(TextAnnotation)
     case removeText(TextAnnotation)
     case moveText(Int, NSPoint, NSPoint)
+    case resizeText(Int, TextAnnotation, TextAnnotation)  // index, from, to
     case moveArrow(Int, NSPoint, NSPoint, NSPoint, NSPoint)  // index, fromStart, fromEnd, toStart, toEnd
     case moveLine(Int, NSPoint, NSPoint, NSPoint, NSPoint)
     case moveRectangle(Int, NSPoint, NSPoint, NSPoint, NSPoint)
@@ -418,6 +456,7 @@ extension TextAnnotation: Equatable {
     public static func == (lhs: TextAnnotation, rhs: TextAnnotation) -> Bool {
         return lhs.text == rhs.text && lhs.position == rhs.position && lhs.color.isEqual(rhs.color)
             && lhs.fontSize == rhs.fontSize && lhs.hasBackground == rhs.hasBackground
+            && lhs.wrapWidth == rhs.wrapWidth
             && lhs.creationTime == rhs.creationTime
     }
 }

@@ -1024,4 +1024,162 @@ final class SelectionFeatureTests: XCTestCase {
         XCTAssertTrue(copied.hasBackground)
         XCTAssertEqual(copied.creationTime, 1.5)
     }
+
+    // MARK: - Text Resize Anchors
+
+    /// Places one label, selects it, and returns the box its anchors are drawn on.
+    @discardableResult
+    private func selectSingleLabel(fontSize: CGFloat = 24) -> NSRect {
+        overlayView.currentTool = .select
+        overlayView.textAnnotations = [
+            TextAnnotation(
+                text: "Label", position: NSPoint(x: 100, y: 100), color: .red, fontSize: fontSize)
+        ]
+        overlayView.selectedObjects = [.text(index: 0)]
+        return overlayView.calculateSelectionBoundingBox()
+    }
+
+    func testAnchorsHitTestByPositionAndOnlyForOneSelectedLabel() {
+        let box = selectSingleLabel()
+
+        // The view is not flipped: y grows upward, so maxY is the north edge.
+        XCTAssertEqual(overlayView.textResizeHandle(at: NSPoint(x: box.minX, y: box.minY)), .sw)
+        XCTAssertEqual(overlayView.textResizeHandle(at: NSPoint(x: box.maxX, y: box.minY)), .se)
+        XCTAssertEqual(overlayView.textResizeHandle(at: NSPoint(x: box.maxX, y: box.maxY)), .ne)
+        XCTAssertEqual(overlayView.textResizeHandle(at: NSPoint(x: box.midX, y: box.maxY)), .n)
+        XCTAssertEqual(overlayView.textResizeHandle(at: NSPoint(x: box.maxX, y: box.midY)), .e)
+        XCTAssertNil(overlayView.textResizeHandle(at: NSPoint(x: box.midX, y: box.midY)))
+
+        // Nothing selected: no box to transform.
+        overlayView.selectedObjects = []
+        XCTAssertNil(overlayView.textResizeHandle(at: NSPoint(x: box.minX, y: box.minY)))
+
+        // Two labels: a multi-selection has no single box either.
+        _ = selectSingleLabel()
+        overlayView.textAnnotations.append(
+            TextAnnotation(
+                text: "Other", position: NSPoint(x: 400, y: 400), color: .red, fontSize: 24))
+        overlayView.selectedObjects = [.text(index: 0), .text(index: 1)]
+        XCTAssertNil(overlayView.textResizeHandle(at: NSPoint(x: box.minX, y: box.minY)))
+    }
+
+    func testDraggingCornerScalesFontAndLeavesTheOppositeCornerInPlace() {
+        let box = selectSingleLabel(fontSize: 24)
+
+        overlayView.beginTextResize(.se)
+        // The south-east anchor is dragged outward; north and west stay put.
+        overlayView.updateTextResize(
+            to: NSPoint(x: box.minX + box.width * 2, y: box.maxY - box.height * 2))
+
+        XCTAssertEqual(overlayView.textAnnotations[0].fontSize, 48, accuracy: 0.001)
+        let grown = overlayView.calculateSelectionBoundingBox()
+        XCTAssertEqual(grown.minX, box.minX, accuracy: 0.001)
+        XCTAssertEqual(grown.maxY, box.maxY, accuracy: 0.001)
+        XCTAssertGreaterThan(grown.width, box.width)
+        XCTAssertGreaterThan(grown.height, box.height)
+
+        // Dragging back to where it started returns the label to its original size.
+        overlayView.updateTextResize(to: NSPoint(x: box.maxX, y: box.minY))
+        XCTAssertEqual(overlayView.textAnnotations[0].fontSize, 24, accuracy: 0.001)
+
+        overlayView.endTextResize()
+        XCTAssertNil(overlayView.resizeHandle)
+        XCTAssertNil(overlayView.resizeStart)
+    }
+
+    func testFontSizeStopsAtTheConfiguredBounds() {
+        let box = selectSingleLabel(fontSize: 24)
+
+        overlayView.beginTextResize(.ne)
+        overlayView.updateTextResize(to: NSPoint(x: box.maxX + 10_000, y: box.maxY + 10_000))
+        XCTAssertEqual(overlayView.textAnnotations[0].fontSize, textAnnotationFontSizeRange.upperBound)
+
+        // Every event measures from where the gesture began, so the same drag collapses
+        // straight to the lower bound instead of stepping down from the clamped value.
+        overlayView.updateTextResize(to: NSPoint(x: box.minX + 1, y: box.minY + 1))
+        XCTAssertEqual(overlayView.textAnnotations[0].fontSize, textAnnotationFontSizeRange.lowerBound)
+    }
+
+    func testSetSelectedTextFontSizeChangesOnlyTheSelectedLabel() {
+        overlayView.currentTool = .select
+        overlayView.textAnnotations = [
+            TextAnnotation(text: "One", position: NSPoint(x: 100, y: 100), color: .red, fontSize: 18),
+            TextAnnotation(text: "Two", position: NSPoint(x: 300, y: 300), color: .red, fontSize: 18),
+        ]
+        overlayView.selectedObjects = [.text(index: 1)]
+
+        overlayView.setSelectedTextFontSize(44)
+
+        XCTAssertEqual(overlayView.textAnnotations[0].fontSize, 18)
+        XCTAssertEqual(overlayView.textAnnotations[1].fontSize, 44)
+    }
+
+    // MARK: - Wrapped Text Boxes
+
+    func testWrappingMakesTheBoxTallerInsteadOfWider() {
+        let text = "Wrapping needs several words before a line ever breaks"
+        let single = TextAnnotation(
+            text: text, position: .zero, color: .red, fontSize: 24)
+        let wrapped = TextAnnotation(
+            text: text, position: .zero, color: .red, fontSize: 24, wrapWidth: 80)
+
+        let singleBounds = single.bounds(fallbackInsets: OverlayView.plainLabelSlop)
+        let wrappedBounds = wrapped.bounds(fallbackInsets: OverlayView.plainLabelSlop)
+
+        // The wrapped box keeps the fixed width plus insets, and is taller because AppKit
+        // has broken the same text into several lines.
+        XCTAssertEqual(
+            wrappedBounds.width,
+            wrapped.textSize().width + OverlayView.plainLabelSlop.left
+                + OverlayView.plainLabelSlop.right,
+            accuracy: 0.001)
+        XCTAssertLessThan(wrappedBounds.width, singleBounds.width)
+        XCTAssertGreaterThan(wrappedBounds.height, singleBounds.height)
+        XCTAssertEqual(wrapped.textSize().width, 80, accuracy: 0.001)
+    }
+
+    func testSideHandleFixesTheWidthAndLeavesTheFontSizeAlone() {
+        overlayView.currentTool = .select
+        overlayView.textAnnotations = [
+            TextAnnotation(
+                text: "Wrapping needs several words before a line ever breaks",
+                position: NSPoint(x: 100, y: 100), color: .red, fontSize: 24)
+        ]
+        overlayView.selectedObjects = [.text(index: 0)]
+        let box = overlayView.calculateSelectionBoundingBox()
+
+        overlayView.beginTextResize(.e)
+        overlayView.updateTextResize(to: NSPoint(x: box.minX + 70, y: box.midY))
+
+        let label = overlayView.textAnnotations[0]
+        XCTAssertEqual(label.fontSize, 24, accuracy: 0.001)
+        guard let wrapWidth = label.wrapWidth else {
+            return XCTFail("dragging a side anchor must give the label a fixed width")
+        }
+        XCTAssertGreaterThan(wrapWidth, TextAnnotation.minimumWrapWidth)
+        XCTAssertGreaterThan(
+            overlayView.calculateSelectionBoundingBox().height, box.height,
+            "a narrower box must wrap to more lines")
+
+        overlayView.endTextResize()
+    }
+
+    func testCornerDragFixesTheWidthAsWellAsScalingTheFont() {
+        _ = selectSingleLabel(fontSize: 24)
+        overlayView.textAnnotations[0].text =
+            "Wrapping needs several words before a line ever breaks"
+        overlayView.selectedObjects = [.text(index: 0)]
+        let box = overlayView.calculateSelectionBoundingBox()
+
+        overlayView.beginTextResize(.se)
+        overlayView.updateTextResize(
+            to: NSPoint(x: box.minX + box.width * 0.3, y: box.maxY - box.height * 2))
+
+        let label = overlayView.textAnnotations[0]
+        XCTAssertNotNil(
+            label.wrapWidth,
+            "a corner must also give the box a width, not only scale the font")
+        XCTAssertLessThan(label.fontSize, 24)
+        overlayView.endTextResize()
+    }
 }
